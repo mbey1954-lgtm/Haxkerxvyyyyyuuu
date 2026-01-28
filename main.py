@@ -4,10 +4,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-app = FastAPI()
-
+# ===================== CONFIG =====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # opsiyonel
 UPLOAD_DIR = "uploads"
 BIG_DIR = "big_results"
 DATA_FILE = "data.json"
@@ -16,54 +14,56 @@ LOG_FILE = "logs.json"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(BIG_DIR, exist_ok=True)
 
-# ---------------- STORAGE ----------------
-def load(path, default):
+app = FastAPI()
+
+# ===================== UTILS =====================
+def load_json(path, default):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return default
 
-def save(path, data):
+def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-DATA = load(DATA_FILE, [])
-LOGS = load(LOG_FILE, [])
+DATA = load_json(DATA_FILE, [])
+LOGS = load_json(LOG_FILE, [])
 
-# ---------------- RATE LIMIT ----------------
-RATE_LIMIT = {}
-LIMIT = 60  # dakika başı istek
+# ===================== RATE LIMIT (IP) =====================
+RATE = {}
+PER_MIN = 60  # dakika başı istek
 
-def check_rate(ip):
+def allow(ip):
     now = int(time.time())
-    RATE_LIMIT.setdefault(ip, [])
-    RATE_LIMIT[ip] = [t for t in RATE_LIMIT[ip] if now - t < 60]
-    if len(RATE_LIMIT[ip]) >= LIMIT:
+    RATE.setdefault(ip, [])
+    RATE[ip] = [t for t in RATE[ip] if now - t < 60]
+    if len(RATE[ip]) >= PER_MIN:
         return False
-    RATE_LIMIT[ip].append(now)
+    RATE[ip].append(now)
     return True
 
-# ---------------- CACHE ----------------
+# ===================== CACHE =====================
 CACHE = {}
 CACHE_TTL = 60
 
-def cache_get(key):
-    val = CACHE.get(key)
-    if val and time.time() - val["time"] < CACHE_TTL:
-        return val["data"]
+def cache_get(k):
+    v = CACHE.get(k)
+    if v and time.time() - v["t"] < CACHE_TTL:
+        return v["d"]
     return None
 
-def cache_set(key, data):
-    CACHE[key] = {"time": time.time(), "data": data}
+def cache_set(k, d):
+    CACHE[k] = {"t": time.time(), "d": d}
 
-# ---------------- PARSER ----------------
+# ===================== PARSER =====================
 def parse_file(path):
     out = []
     if path.endswith(".txt"):
         with open(path, errors="ignore") as f:
             out += f.read().splitlines()
     elif path.endswith(".csv"):
-        with open(path, errors="ignore") as f:
+        with open(path, errors="ignore", newline="") as f:
             for r in csv.reader(f):
                 out.append(" | ".join(r))
     elif path.endswith(".json"):
@@ -81,107 +81,126 @@ def parse_zip(path):
                 res += parse_file(p)
     return res
 
-# ---------------- TELEGRAM BOT ----------------
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===================== TELEGRAM BOT (DOSYA YÜKLEME) =====================
+async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     name = doc.file_name.lower()
-
-    if not any(name.endswith(x) for x in [".txt", ".csv", ".json", ".zip"]):
+    if not any(name.endswith(x) for x in (".txt", ".csv", ".json", ".zip")):
         await update.message.reply_text("❌ Desteklenmeyen dosya")
         return
 
-    file = await doc.get_file()
-    path = f"{UPLOAD_DIR}/{doc.file_name}"
-    await file.download_to_drive(path)
+    tg = await doc.get_file()
+    path = os.path.join(UPLOAD_DIR, doc.file_name)
+    await tg.download_to_drive(path)
 
     new = parse_zip(path) if path.endswith(".zip") else parse_file(path)
     DATA.extend(new)
-    save(DATA_FILE, DATA)
+    save_json(DATA_FILE, DATA)
 
     await update.message.reply_text(
-        f"✅ {len(new)} veri alındı\n🌐 API: /api"
+        f"✅ {len(new)} veri alındı\n🌐 API: https://zordoxflexapi.onrender.com/api"
     )
 
 async def start_bot():
-    bot = Application.builder().token(BOT_TOKEN).build()
-    bot.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    await bot.initialize()
-    await bot.start()
-    await bot.updater.start_polling()
+    if not BOT_TOKEN:
+        return
+    app_bot = Application.builder().token(BOT_TOKEN).build()
+    app_bot.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+    await app_bot.initialize()
+    await app_bot.start()
+    await app_bot.updater.start_polling()
 
 @app.on_event("startup")
 async def startup():
-    if BOT_TOKEN:
-        asyncio.create_task(start_bot())
+    asyncio.create_task(start_bot())
 
-# ---------------- TEK API ----------------
+# ===================== TEK API =====================
 @app.get("/api")
 def api(
     request: Request,
     mode: str = Query("search"),
     query: str = Query(""),
-    output: str = Query("json"),
-    limit: int = Query(50)
+    output: str = Query("json"),   # json | txt | csv
+    limit: int = Query(50),
+    file: str = Query("")          # download için
 ):
     ip = request.client.host
-    if not check_rate(ip):
-        return JSONResponse({"error": "rate limit"}, status_code=429)
+    if not allow(ip):
+        return JSONResponse({"error": "rate_limit"}, status_code=429)
 
-    cache_key = f"{mode}:{query}:{output}:{limit}"
+    cache_key = f"{mode}:{query}:{output}:{limit}:{file}"
     cached = cache_get(cache_key)
     if cached:
         return cached
 
-    results = []
+    # ---- DOWNLOAD (aynı endpoint) ----
+    if mode == "download":
+        path = os.path.join(BIG_DIR, file)
+        if os.path.exists(path):
+            return FileResponse(path, media_type="text/plain")
+        return JSONResponse({"error": "file_not_found"}, status_code=404)
 
+    # ---- STATS ----
     if mode == "stats":
         res = {
             "total_data": len(DATA),
-            "cache_size": len(CACHE),
+            "cache_items": len(CACHE),
             "logs": len(LOGS)
         }
         cache_set(cache_key, res)
         return res
 
-    if mode in ["search", "smart"]:
+    results = []
+
+    # ---- SEARCH MODES ----
+    if mode in ("search", "smart"):
+        q = query.lower()
         for x in DATA:
-            if query.lower() in x.lower():
+            if q in x.lower():
                 results.append(x)
 
-    if mode == "strict":
+    elif mode == "strict":
         results = [x for x in DATA if x == query]
 
-    if mode == "regex":
-        r = re.compile(query, re.I)
-        results = [x for x in DATA if r.search(x)]
+    elif mode == "regex":
+        try:
+            r = re.compile(query, re.I)
+            results = [x for x in DATA if r.search(x)]
+        except re.error:
+            return JSONResponse({"error": "bad_regex"}, status_code=400)
 
-    if mode == "random":
+    elif mode == "random":
         results = random.sample(DATA, min(limit, len(DATA)))
 
-    if mode == "count":
+    elif mode == "count":
         return {"count": len(results)}
 
-    # LOG
+    # ---- LOG ----
     LOGS.append({
         "ip": ip,
         "mode": mode,
         "query": query,
         "count": len(results),
-        "time": int(time.time())
+        "ts": int(time.time())
     })
-    save(LOG_FILE, LOGS)
+    save_json(LOG_FILE, LOGS)
 
+    # ---- BIG RESULT -> TXT ----
     if len(results) > 1000:
-        fname = f"{BIG_DIR}/result_{int(time.time())}.txt"
-        with open(fname, "w", encoding="utf-8") as f:
+        fname = f"result_{int(time.time())}.txt"
+        fpath = os.path.join(BIG_DIR, fname)
+        with open(fpath, "w", encoding="utf-8") as f:
             f.write("\n".join(results))
-        return {
+        res = {
             "count": len(results),
-            "download": "/api?mode=download&query=" + os.path.basename(fname)
+            "download": f"/api?mode=download&file={fname}"
         }
+        cache_set(cache_key, res)
+        return res
 
     results = results[:limit]
 
+    # ---- OUTPUT ----
     if output == "txt":
         return PlainTextResponse("\n".join(results))
     if output == "csv":
@@ -190,9 +209,3 @@ def api(
     res = {"count": len(results), "results": results}
     cache_set(cache_key, res)
     return res
-
-@app.get("/api", include_in_schema=False)
-def download(mode: str = Query(""), query: str = Query("")):
-    if mode == "download":
-        path = f"{BIG_DIR}/{query}"
-        return FileResponse(path)
